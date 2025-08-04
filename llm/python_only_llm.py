@@ -22,17 +22,17 @@ class PythonOnlyLLM:
 
     def _is_python_query(self, prompt: str) -> bool:
         prompt_lower = prompt.lower()
-
-        # BLOCK if any other language is present
+        
         if any(lang in prompt_lower for lang in self.prog_langs):
             return False
-        
-        # ALLOW only if "python" or a clearly standalone "py" appears
-        return (
-            "python" in prompt_lower
-            or " py " in f" {prompt_lower} "
-            or prompt_lower.strip().startswith("py")
-        )
+    
+        keywords = [
+            "python", "py", "list", "tuple", "dictionary", "loop", "function", "class",
+            "lambda", "comprehension", "decorator", "pandas", "numpy", "code",
+            "def", "import", "syntax", "error", "exception", "recursion"
+        ]
+        return any(kw in prompt_lower for kw in keywords)
+
 
     def invoke(self, prompt: str):
         if not self._is_python_query(prompt):
@@ -51,3 +51,4 @@ class PythonOnlyLLM:
             return {"output": "❌ This assistant only supports **Python-related** queries. Please ask something about Python."}
 
         return await self.llm.ainvoke(messages)
+
