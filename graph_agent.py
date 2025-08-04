@@ -1,4 +1,5 @@
 import os
+import re 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END
 from sentence_transformers import SentenceTransformer
@@ -12,7 +13,14 @@ python_intents = [
     "What is a Python dictionary?",
     "Write a Python function to reverse a string.",
     "Explain Python decorators.",
-    "def greet(name): return f'Hello {name}'"
+    "How to write a class in Python?",
+    "How is recursion implemented in Python?",
+    "What is a lambda function?",
+    "What is list comprehension?",
+    "How to use for loop?",
+    "How does try except block work?",
+    "def greet(name): return f'Hello {name}'",
+    "What is the use of enumerate in Python?"
 ]
 
 non_python_intents = [
@@ -35,11 +43,13 @@ def is_python_intent(user_input: str, threshold: float = 0.4) -> bool:
 
 def is_python_related(text: str) -> bool:
     keywords = [
-        "python", "py", "list", "tuple", "dictionary", "loop", "function",
-        "class", "lambda", "comprehension", "decorator", "pandas", "numpy",
-        "code", "def", "import", "syntax", "error", "exception", "recursion"
+        "python", "list", "tuple", "dictionary", "loop", "function", "class",
+        "lambda", "comprehension", "decorator", "pandas", "numpy", "code",
+        "def", "import", "syntax", "error", "exception", "recursion", "variable",
+        "expression", "statement", "while", "for", "if", "elif", "else"
     ]
-    return any(kw in text.lower() for kw in keywords)
+    words = re.findall(r"\b\w+\b", text.lower())
+    return any(kw in words for kw in keywords)
 
 
 class AgentState(dict):
@@ -67,5 +77,6 @@ def create_graph_agent():
     builder.set_entry_point("process")
     builder.add_edge("process", END)
     return builder.compile()
+
 
 
