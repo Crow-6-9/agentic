@@ -51,6 +51,10 @@ def is_python_related(text: str) -> bool:
     words = re.findall(r"\b\w+\b", text.lower())
     return any(kw in words for kw in keywords)
 
+# Combined final filter
+def allow_prompt(prompt: str) -> bool:
+    return is_python_related(prompt) or is_python_intent(prompt)
+
 
 class AgentState(dict):
     input: str
@@ -59,7 +63,7 @@ class AgentState(dict):
 def run_tool(state: AgentState) -> AgentState:
     user_input = state["input"]
 
-    if is_python_intent(user_input) or is_python_related(user_input):
+    if allow_prompt(user_input):
         response = llm.invoke(user_input)
         return {
             "input": user_input,
@@ -71,12 +75,14 @@ def run_tool(state: AgentState) -> AgentState:
             "output": "❌ This tool only handles Python-related queries or executable Python code."
         }
 
+
 def create_graph_agent():
     builder = StateGraph(AgentState)
     builder.add_node("process", run_tool)
     builder.set_entry_point("process")
     builder.add_edge("process", END)
     return builder.compile()
+
 
 
 
