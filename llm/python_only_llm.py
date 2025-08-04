@@ -1,6 +1,7 @@
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_openai import AzureChatOpenAI
+import re
 
 load_dotenv()
 
@@ -20,10 +21,12 @@ class PythonOnlyLLM:
             "sql", "bash", "shell", "powershell", "vb.net", "dart"
         ]
 
+
     def _is_python_query(self, prompt: str) -> bool:
         prompt_lower = prompt.lower()
-        
-        if any(lang in prompt_lower for lang in self.prog_langs):
+    
+        # Join with word boundaries to avoid matching substrings like "decorator" → "r"
+        if re.search(r"\b(" + "|".join(re.escape(lang.strip()) for lang in self.prog_langs) + r")\b", prompt_lower):
             return False
     
         keywords = [
@@ -31,7 +34,9 @@ class PythonOnlyLLM:
             "lambda", "comprehension", "decorator", "pandas", "numpy", "code",
             "def", "import", "syntax", "error", "exception", "recursion"
         ]
+    
         return any(kw in prompt_lower for kw in keywords)
+
 
 
     def invoke(self, prompt: str):
@@ -51,4 +56,5 @@ class PythonOnlyLLM:
             return {"output": "❌ This assistant only supports **Python-related** queries. Please ask something about Python."}
 
         return await self.llm.ainvoke(messages)
+
 
