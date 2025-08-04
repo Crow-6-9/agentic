@@ -13,8 +13,15 @@ def is_python_question_llm(prompt: str) -> bool:
         f"Question: \"{prompt}\"\n\n"
         "Respond with just \"yes\" or \"no\"."
     )
-    result = llm.invoke(judge_prompt).lower()
+
+    response = llm.invoke(judge_prompt)
+    if hasattr(response, "content"):
+        result = response.content.strip().lower()
+    else:
+        result = str(response).strip().lower()
+
     return "yes" in result
+
   
 # ✅ LangGraph state object
 class AgentState(dict):
@@ -44,3 +51,4 @@ def create_graph_agent():
     builder.set_entry_point("process")
     builder.add_edge("process", END)
     return builder.compile()
+
