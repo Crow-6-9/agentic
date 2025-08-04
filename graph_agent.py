@@ -16,27 +16,12 @@ class AgentState(dict):
 def run_tool(state: AgentState) -> AgentState:
     user_input = state["input"]
 
-    # 🔐 Use RAG to allow only Python questions
-    if rag.is_python_question(user_input):
-        context = rag.retrieve_context(user_input)
-
-        prompt = f"""
-You are a helpful Python assistant.
-Answer the following question using this context:
-
-----------------------
-{context}
-----------------------
-
-Question: {user_input}
-"""
-
-        response = llm.invoke(prompt)
+    if is_python_question_llm(user_input):
+        response = llm.invoke(user_input)
         return {
             "input": user_input,
             "output": response if isinstance(response, str) else response.content.strip()
         }
-
     else:
         return {
             "input": user_input,
@@ -50,3 +35,4 @@ def create_graph_agent():
     builder.set_entry_point("process")
     builder.add_edge("process", END)
     return builder.compile()
+
