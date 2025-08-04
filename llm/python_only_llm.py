@@ -30,9 +30,27 @@ class PythonOnlyLLM:
             return False
     
         keywords = [
-            "python", "py", "list", "tuple", "dictionary", "loop", "function", "class",
-            "lambda", "comprehension", "decorator", "pandas", "numpy", "code",
-            "def", "import", "syntax", "error", "exception", "recursion"
+                  "python", "py", "def", "class", "lambda", "import", "from", "as", "return",
+            "if", "elif", "else", "while", "for", "break", "continue", "pass", "with",
+            "try", "except", "finally", "raise", "assert", "yield", "global", "nonlocal",
+            "del", "async", "await", "not", "and", "or", "is", "in",
+            "int", "float", "bool", "str", "list", "tuple", "set", "dict", "bytes", "None",
+            "print", "len", "input", "open", "enumerate", "zip", "map", "filter", "reduce",
+            "sorted", "reversed", "sum", "min", "max", "any", "all", "eval", "exec",
+            "isinstance", "super", "abs", "round", "divmod", "pow", "bin", "oct", "hex",
+            "list comprehension", "dict comprehension", "set comprehension",
+            "generator expression", "self", "__init__", "__str__", "__repr__",
+            "method", "property", "@staticmethod", "@classmethod", "@property",
+            "@dataclass", "functools", "pandas", "numpy", "matplotlib", "seaborn",
+            "requests", "os", "sys", "re", "json", "math", "datetime", "time", "csv",
+            "random", "collections", "itertools", "typing", "unittest", "pytest",
+            "try except", "traceback", "ValueError", "TypeError", "IndexError",
+            "KeyError", "IOError", "ZeroDivisionError", "with open", "os.path",
+            "argparse", "pathlib", "syntax", "semantics", "pep8", "virtualenv",
+            "requirements.txt", "pip", "venv", "conda", "deepcopy", "shallow copy",
+            "recursion", "iteration", "generator", "iterator", "comprehension",
+            "zip", "enumerate", "lambda", "scikit-learn", "tensorflow", "keras",
+            "torch", "huggingface", "transformers"
         ]
     
         return any(kw in prompt_lower for kw in keywords)
@@ -56,5 +74,6 @@ class PythonOnlyLLM:
             return {"output": "❌ This assistant only supports **Python-related** queries. Please ask something about Python."}
 
         return await self.llm.ainvoke(messages)
+
 
 
