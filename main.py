@@ -5,7 +5,7 @@ from graph_agent import create_graph_agent
 agent = create_graph_agent()
 
 st.set_page_config(page_title="Python Agent", layout="wide")
-st.title("🧠 Python Playground")
+st.title("Agent Python 🐍")
 
 # ✅ CSS Styling
 st.markdown("""
