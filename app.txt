@@ -1,0 +1,513 @@
+"""
+app.py — JD Matcher v2 (Standalone)
+
+No FastAPI, no HTTP calls. Everything runs in one process.
+
+Two Chainlit Chat Profiles:
+  📋 Resume Matcher   — guided 3-step flow: upload JD → upload resumes → ranked results
+                        Each resume is stored as ONE chunk in ChromaDB.
+  🔍 Recruiter Search — freeform chat: type anything to semantically search the DB.
+
+Run:
+    chainlit run app.py
+"""
+
+import os
+import uuid
+import logging
+
+import chainlit as cl
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from core.logging_config import setup_logging
+setup_logging(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+from services.parser     import extract_text_from_docx, extract_metadata
+from services.embedding  import get_embedding
+from services.matcher    import (
+    compute_tfidf_score,
+    compute_embedding_score,
+    compute_hybrid_score,
+    fit_label,
+    is_match,
+    TFIDF_WEIGHT,
+    EMBEDDING_WEIGHT,
+    SIMILARITY_THRESHOLD,
+)
+from services.vectorstore import add_resume, query_resumes, get_stats
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# CHAT PROFILES
+# ════════════════════════════════════════════════════════════════════════════════
+
+@cl.set_chat_profiles
+async def chat_profile():
+    return [
+        cl.ChatProfile(
+            name="📋 Resume Matcher",
+            markdown_description=(
+                "**Upload a Job Description and resumes.**\n\n"
+                "Scores each resume using TF-IDF + Embedding hybrid scoring. "
+                "Every resume is stored in ChromaDB for recruiter querying."
+            ),
+        ),
+        cl.ChatProfile(
+            name="🔍 Recruiter Search",
+            markdown_description=(
+                "**Search stored resumes using natural language.**\n\n"
+                "Ask things like *'find a LangChain developer'* or "
+                "*'who knows React and Node?'* — powered by ChromaDB semantic search."
+            ),
+        ),
+    ]
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# UI HELPERS
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _emoji(label: str) -> str:
+    return {"Strong": "🟢", "Good": "🟡", "Weak": "🔴"}.get(label, "⚪")
+
+
+def _matcher_table(resumes: list) -> str:
+    header = (
+        "| Rank | Name | Email | TF-IDF | Embedding | Hybrid | Fit |\n"
+        "|:----:|------|-------|:------:|:---------:|:------:|:---:|\n"
+    )
+    rows = ""
+    for i, r in enumerate(resumes, 1):
+        label = fit_label(r["hybrid_score"])
+        rows += (
+            f"| {i} | {r['meta']['name']} | {r['meta']['email']} "
+            f"| {r['tfidf']:.4f} | {r['emb']:.4f} | {r['hybrid']:.4f} "
+            f"| {_emoji(label)} {label} |\n"
+        )
+    return header + rows
+
+
+def _search_table(candidates: list) -> str:
+    header = (
+        "| Rank | Name | Email | Query Match | JD Hybrid | Fit |\n"
+        "|:----:|------|-------|:-----------:|:---------:|:---:|\n"
+    )
+    rows = ""
+    for i, c in enumerate(candidates, 1):
+        label = fit_label(c["hybrid_score"])
+        rows += (
+            f"| {i} | {c['name']} | {c['email']} "
+            f"| `{c['search_similarity']:.4f}` | `{c['hybrid_score']:.4f}` "
+            f"| {_emoji(label)} {label} |\n"
+        )
+    return header + rows
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PROFILE 1 — RESUME MATCHER (3-step guided flow)
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def step_upload_jd():
+    logger.info("Waiting for JD upload")
+    files = await cl.AskFileMessage(
+        content=(
+            "### 📋 Step 1 of 3 — Upload Job Description\n"
+            "Upload the Job Description as a **.docx** file."
+        ),
+        accept=["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+        max_files=1,
+        raise_on_timeout=False,
+    ).send()
+
+    if not files:
+        await cl.Message(content="⚠️ No file received. Refresh and try again.").send()
+        return
+
+    file = files[0]
+    await cl.Message(content=f"⏳ Reading and embedding **{file.name}**...").send()
+
+    try:
+        jd_text = extract_text_from_docx(file.path)
+    except Exception as e:
+        await cl.Message(content=f"❌ Could not read the file: {e}").send()
+        return
+
+    jd_embedding = get_embedding(jd_text)
+    if not jd_embedding:
+        await cl.Message(
+            content=(
+                "❌ Embedding API failed.\n"
+                "Check `API_KEY`, `EMBEDDING_MODEL`, and `EMBEDDING_URL` in your `.env`."
+            )
+        ).send()
+        return
+
+    session_id = str(uuid.uuid4())
+    cl.user_session.set("session_id",   session_id)
+    cl.user_session.set("jd_text",      jd_text)
+    cl.user_session.set("jd_embedding", jd_embedding)
+    cl.user_session.set("resumes",      [])
+
+    logger.info(f"JD loaded — session={session_id}  file={file.name}")
+    await cl.Message(
+        content=f"✅ **Job Description loaded:** `{file.name}`\n> Session ID: `{session_id}`"
+    ).send()
+    await step_upload_resumes()
+
+
+async def step_upload_resumes():
+    logger.info("Waiting for resume uploads")
+    files = await cl.AskFileMessage(
+        content=(
+            "### 📂 Step 2 of 3 — Upload Resumes\n"
+            "Upload up to **10 resumes** (.docx).\n"
+            "Each resume is scored and stored as **one chunk** in ChromaDB."
+        ),
+        accept=["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+        max_files=10,
+        raise_on_timeout=False,
+    ).send()
+
+    if not files:
+        await cl.Message(content="⚠️ No resumes received.").send()
+        return
+
+    jd_text      = cl.user_session.get("jd_text")
+    jd_embedding = cl.user_session.get("jd_embedding")
+    session_id   = cl.user_session.get("session_id")
+    resumes      = cl.user_session.get("resumes") or []
+    skipped      = 0
+
+    await cl.Message(content=f"⏳ Processing **{len(files)}** resume(s)...").send()
+
+    for file in files:
+        logger.info(f"Processing: {file.name}")
+
+        # Parse
+        try:
+            text = extract_text_from_docx(file.path)
+        except Exception as e:
+            logger.error(f"Parse error — {file.name}: {e}")
+            await cl.Message(content=f"⚠️ Skipped **{file.name}** — could not read file.").send()
+            skipped += 1
+            continue
+
+        # Save original .docx to local resumes/ folder
+        import shutil
+        resumes_dir = os.path.join(os.path.dirname(__file__), "resumes")
+        os.makedirs(resumes_dir, exist_ok=True)
+        save_path = os.path.join(resumes_dir, file.name)
+        shutil.copy2(file.path, save_path)
+        logger.info(f"Saved resume locally → {save_path}")
+
+        # Metadata
+        meta = extract_metadata(text)
+
+        # Embed
+        resume_embedding = get_embedding(text)
+        if not resume_embedding:
+            await cl.Message(content=f"⚠️ Skipped **{file.name}** — embedding API failed.").send()
+            skipped += 1
+            continue
+
+        # Score
+        tfidf   = compute_tfidf_score(jd_text, text)
+        emb     = compute_embedding_score(jd_embedding, resume_embedding)
+        hybrid  = compute_hybrid_score(tfidf, emb)
+        matched = is_match(hybrid)
+        label   = fit_label(hybrid)
+
+        logger.info(
+            f"  {meta['name']} ({meta['email']}) | "
+            f"tfidf={tfidf:.4f} emb={emb:.4f} hybrid={hybrid:.4f} → {label}"
+        )
+
+        # Store in ChromaDB — ONE resume = ONE chunk
+        doc_id = add_resume(
+            text            = text,
+            embedding       = resume_embedding,
+            name            = meta["name"],
+            email           = meta["email"],
+            filename        = file.name,
+            tfidf_score     = tfidf,
+            embedding_score = emb,
+            hybrid_score    = hybrid,
+            matches_jd      = matched,
+            session_id      = session_id,
+        )
+
+        resumes.append({
+            "filename": file.name,
+            "meta":     meta,
+            "tfidf":    tfidf,
+            "emb":      emb,
+            "hybrid":   hybrid,
+            "matched":  matched,
+            "doc_id":   doc_id,
+        })
+
+        await cl.Message(
+            content=(
+                f"📄 **{file.name}**\n"
+                f"> 👤 {meta['name']}  ·  📧 {meta['email']}\n"
+                f"> TF-IDF: `{tfidf:.4f}` · Embedding: `{emb:.4f}` · Hybrid: `{hybrid:.4f}`"
+                f"  {_emoji(label)} **{label}**\n"
+                f"> 💾 Stored in ChromaDB — `{doc_id}`"
+            )
+        ).send()
+
+    cl.user_session.set("resumes", resumes)
+    if skipped:
+        await cl.Message(content=f"⚠️ {skipped} file(s) skipped.").send()
+
+    await step_show_results()
+
+
+async def step_show_results():
+    resumes = cl.user_session.get("resumes") or []
+    if not resumes:
+        await cl.Message(content="⚠️ No resumes to rank.").send()
+        return
+
+    sorted_r   = sorted(resumes, key=lambda x: x["hybrid"], reverse=True)
+    table      = _matcher_table(sorted_r)
+    matched    = sum(1 for r in sorted_r if r["matched"])
+    unmatched  = len(sorted_r) - matched
+    stats      = get_stats()
+
+    logger.info(f"Results shown — {len(sorted_r)} resumes | DB total: {stats['total']}")
+
+    await cl.Message(
+        content=(
+            "### 🏆 Step 3 of 3 — Ranked Results\n\n"
+            f"**Scoring:** TF-IDF `{TFIDF_WEIGHT*100:.0f}%` + Embedding `{EMBEDDING_WEIGHT*100:.0f}%`  ·  "
+            f"**Threshold:** `{SIMILARITY_THRESHOLD}`\n\n"
+            f"{table}\n\n"
+            f"**This session:** 🟢/🟡 `{matched}` shortlisted  ·  🔴 `{unmatched}` below threshold\n"
+            f"**ChromaDB total:** `{stats['total']}` resume(s) stored\n\n"
+            "_TF-IDF = keyword overlap · Embedding = semantic similarity · Hybrid = weighted ATS score_"
+        )
+    ).send()
+
+    await cl.Message(
+        content=(
+            "**What next?**\n"
+            "- **`more resumes`** — upload more against the same JD\n"
+            "- **`show results`** — re-display this table\n"
+            "- **`db stats`** — ChromaDB info\n"
+            "- **`restart`** — start over with a new JD\n\n"
+            "💡 Switch to **🔍 Recruiter Search** to query all stored resumes by skill."
+        )
+    ).send()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PROFILE 2 — RECRUITER SEARCH
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def handle_search(query: str):
+    logger.info(f"Recruiter query: '{query}'")
+
+    stats = get_stats()
+    if stats["total"] == 0:
+        await cl.Message(
+            content=(
+                "⚠️ The database is empty.\n\n"
+                "Switch to **📋 Resume Matcher**, upload a JD and resumes first."
+            )
+        ).send()
+        return
+
+    n_results    = cl.user_session.get("n_results") or 5
+    only_matched = cl.user_session.get("only_matched") or False
+    filter_note  = " _(JD matches only)_" if only_matched else ""
+
+    await cl.Message(
+        content=f"🔍 Searching **{stats['total']}** resume(s) for: *\"{query}\"*{filter_note}..."
+    ).send()
+
+    query_emb = get_embedding(query)
+    if not query_emb:
+        await cl.Message(content="❌ Embedding API failed. Check your `.env`.").send()
+        return
+
+    candidates = query_resumes(
+        query_embedding = query_emb,
+        n_results       = n_results,
+        only_matched    = only_matched,
+    )
+
+    if not candidates:
+        await cl.Message(
+            content=(
+                f"No results found for **\"{query}\"**.\n"
+                "Try broader terms, or say `show all` to remove the JD filter."
+            )
+        ).send()
+        return
+
+    table = _search_table(candidates)
+    top   = candidates[0]
+    label = fit_label(top["hybrid_score"])
+    date  = top["uploaded_at"][:10] if top.get("uploaded_at") else "N/A"
+
+    await cl.Message(
+        content=(
+            f"### 🎯 Results for: *\"{query}\"*\n\n"
+            f"{table}\n\n"
+            f"---\n"
+            f"**🥇 Top Match**\n"
+            f"> 👤 **{top['name']}**  ·  📧 `{top['email']}`\n"
+            f"> Query match: `{top['search_similarity']:.4f}` · "
+            f"JD score: `{top['hybrid_score']:.4f}` {_emoji(label)}\n"
+            f"> Uploaded: `{date}`\n\n"
+            "_Query Match = similarity to your search · JD Score = fit against original JD_"
+        )
+    ).send()
+
+    logger.info(
+        f"Query '{query}' → {len(candidates)} result(s) | "
+        f"top: {top['name']} ({top['email']}) sim={top['search_similarity']:.4f}"
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# CHAINLIT ENTRY POINTS
+# ════════════════════════════════════════════════════════════════════════════════
+
+@cl.on_chat_start
+async def start():
+    profile = cl.user_session.get("chat_profile")
+    logger.info(f"Chat started — profile='{profile}'")
+    stats = get_stats()
+
+    if profile == "📋 Resume Matcher":
+        cl.user_session.set("session_id",   None)
+        cl.user_session.set("jd_text",      None)
+        cl.user_session.set("jd_embedding", None)
+        cl.user_session.set("resumes",      [])
+
+        await cl.Message(
+            content=(
+                "# 🤖 ATS Resume Matcher\n"
+                "Hybrid scoring: **TF-IDF** (keyword overlap) + **Embeddings** (semantic meaning).\n"
+                "Each resume is stored as **one chunk** in ChromaDB — queryable via Recruiter Search.\n\n"
+                f"💾 ChromaDB currently holds **{stats['total']}** resume(s).\n\n"
+                "Let's go! 👇"
+            )
+        ).send()
+        await step_upload_jd()
+
+    elif profile == "🔍 Recruiter Search":
+        cl.user_session.set("n_results",    5)
+        cl.user_session.set("only_matched", False)
+
+        if stats["total"] == 0:
+            await cl.Message(
+                content=(
+                    "# 🔍 Recruiter Search\n\n"
+                    "⚠️ No resumes in the database yet.\n\n"
+                    "Switch to **📋 Resume Matcher**, upload a JD and resumes first."
+                )
+            ).send()
+        else:
+            await cl.Message(
+                content=(
+                    "# 🔍 Recruiter Search\n"
+                    f"**{stats['total']}** resume(s) available to search.\n\n"
+                    "Just describe what you're looking for:\n"
+                    "> *\"Find a LangChain developer\"*\n"
+                    "> *\"Who knows React and Node.js?\"*\n"
+                    "> *\"Candidates with Python and ML experience\"*\n\n"
+                    "**Settings:**\n"
+                    "- `set results 10` — number of results (default 5, max 20)\n"
+                    "- `only shortlisted` — filter to JD-matched candidates only\n"
+                    "- `show all` — remove that filter\n"
+                    "- `db stats` — database info"
+                )
+            ).send()
+
+
+@cl.on_message
+async def on_message(message: cl.Message):
+    profile = cl.user_session.get("chat_profile")
+    text    = message.content.strip()
+    lower   = text.lower()
+
+    # ── Resume Matcher ─────────────────────────────────────────────────────────
+    if profile == "📋 Resume Matcher":
+
+        if any(k in lower for k in ["more resumes", "upload more", "add resumes"]):
+            if not cl.user_session.get("jd_text"):
+                await cl.Message(content="⚠️ No JD loaded. Say **restart** to begin.").send()
+            else:
+                await step_upload_resumes()
+
+        elif any(k in lower for k in ["restart", "reset", "new jd", "start over"]):
+            cl.user_session.set("jd_text", None)
+            cl.user_session.set("jd_embedding", None)
+            cl.user_session.set("resumes", [])
+            await cl.Message(content="🔄 Session cleared — starting fresh...").send()
+            await step_upload_jd()
+
+        elif any(k in lower for k in ["result", "rank", "show", "table"]):
+            await step_show_results()
+
+        elif "db stats" in lower:
+            s = get_stats()
+            await cl.Message(
+                content=(
+                    f"💾 **ChromaDB Stats**\n"
+                    f"> Collection : `{s['collection']}`\n"
+                    f"> Total resumes : `{s['total']}`\n"
+                    f"> Path : `{s['path']}`"
+                )
+            ).send()
+
+        else:
+            await cl.Message(
+                content=(
+                    "Try:\n"
+                    "- **`more resumes`** — upload more\n"
+                    "- **`show results`** — re-display ranking\n"
+                    "- **`db stats`** — ChromaDB info\n"
+                    "- **`restart`** — new JD"
+                )
+            ).send()
+
+    # ── Recruiter Search ───────────────────────────────────────────────────────
+    elif profile == "🔍 Recruiter Search":
+
+        if lower.startswith("set results"):
+            try:
+                n = max(1, min(int(lower.split()[-1]), 20))
+                cl.user_session.set("n_results", n)
+                await cl.Message(content=f"✅ Returning up to **{n}** results.").send()
+            except ValueError:
+                await cl.Message(content="Usage: `set results 10`").send()
+
+        elif any(k in lower for k in ["only shortlisted", "only matched"]):
+            cl.user_session.set("only_matched", True)
+            await cl.Message(content="✅ Showing only JD-matched candidates.").send()
+
+        elif any(k in lower for k in ["show all", "remove filter"]):
+            cl.user_session.set("only_matched", False)
+            await cl.Message(content="✅ Searching all stored resumes.").send()
+
+        elif "db stats" in lower:
+            s = get_stats()
+            await cl.Message(
+                content=(
+                    f"💾 **ChromaDB Stats**\n"
+                    f"> Collection : `{s['collection']}`\n"
+                    f"> Total resumes : `{s['total']}`\n"
+                    f"> Path : `{s['path']}`"
+                )
+            ).send()
+
+        else:
+            # Everything else = natural language search query
+            await handle_search(text)
