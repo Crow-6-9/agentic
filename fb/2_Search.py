@@ -61,6 +61,7 @@ if search_clicked:
     with st.spinner("Querying ChromaDB..."):
         candidates = query_resumes(
             query_embedding = query_embedding,
+            query_text      = query,       # passed for keyword boost re-ranking
             n_results       = int(n_results),
             only_matched    = only_matched,
         )
