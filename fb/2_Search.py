@@ -52,9 +52,6 @@ if search_clicked:
         st.stop()
 
     with st.spinner(f"Searching for: *{query}*..."):
-        # Query is embedded as-is — no wrapping needed.
-        # The stored chunks are cleaned full-text, so a plain query
-        # sits in the same vector space and similarity is accurate.
         query_embedding = get_embedding(query)
 
     if not query_embedding:
