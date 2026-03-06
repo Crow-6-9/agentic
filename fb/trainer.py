@@ -37,7 +37,7 @@ class BaseTrainer(ABC):
         self.config = config
         self.tokenizer = self._load_tokenizer()
         self.model = self._load_model()
-        self.output_dir = self._get_versioned_dir()
+        self.version, self.output_dir, self.adapter_dir = self._get_version_info()
         self.start_time = 0
         
     def _load_tokenizer(self):
@@ -70,21 +70,43 @@ class BaseTrainer(ABC):
         """Get data collator - implemented by subclasses"""
         pass
     
-    def _get_versioned_dir(self) -> str:
-        """Auto-versioning: create v1, v2, v3... directories"""
-        base = f"./{self.config.model}_{self.config.training_method}_models"
-        os.makedirs(base, exist_ok=True)
-        existing = os.listdir(base)
-        versions = []
-        for d in existing:
-            match = re.search(r'v(\d+)', d)
-            if match:
-                versions.append(int(match.group(1)))
-        version = max(versions, default=0) + 1
+    def _get_version_info(self):
+        """Auto-versioning for models and adapters"""
+        base_model_dir = f"./{self.config.model}_{self.config.training_method}_models"
+        os.makedirs(base_model_dir, exist_ok=True)
         
-        output_dir = f"{base}/{self.config.model}_v{version}_{self.config.training_method}"
-        os.makedirs(output_dir, exist_ok=True)
-        return output_dir
+        if self.config.is_lora:
+            base_weights_dir = f"./{self.config.model}_lora_weights"
+            os.makedirs(base_weights_dir, exist_ok=True)
+            
+            existing = os.listdir(base_weights_dir)
+            versions = []
+            for d in existing:
+                match = re.search(r'v(\d+)', d)
+                if match:
+                    versions.append(int(match.group(1)))
+            version = max(versions, default=0) + 1
+            
+            adapter_dir = f"{base_weights_dir}/v{version}"
+            os.makedirs(adapter_dir, exist_ok=True)
+            
+            output_dir = f"{base_model_dir}/{self.config.model}_v{version}_{self.config.training_method}"
+            os.makedirs(output_dir, exist_ok=True)
+            
+            return version, output_dir, adapter_dir
+        else:
+            existing = os.listdir(base_model_dir)
+            versions = []
+            for d in existing:
+                match = re.search(r'v(\d+)', d)
+                if match:
+                    versions.append(int(match.group(1)))
+            version = max(versions, default=0) + 1
+            
+            output_dir = f"{base_model_dir}/{self.config.model}_v{version}_{self.config.training_method}"
+            os.makedirs(output_dir, exist_ok=True)
+            
+            return version, output_dir, None
     
     def _apply_lora(self):
         """Apply LoRA if configured"""
@@ -113,15 +135,53 @@ class BaseTrainer(ABC):
             'avg_tokens': sum(token_counts) / len(token_counts) if len(token_counts) > 0 else 0
         }
     
+    def _merge_latest_lora(self):
+        """Finds the latest version of LoRA adapter weights, merges with the base model, and saves it."""
+        from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
+        from peft import PeftModel
+        
+        base_weights_dir = f"./{self.config.model}_lora_weights"
+        if not os.path.exists(base_weights_dir):
+            print("No LoRA weights found to merge.")
+            return
+            
+        existing = os.listdir(base_weights_dir)
+        versions = []
+        for d in existing:
+            match = re.search(r'v(\d+)', d)
+            if match:
+                versions.append(int(match.group(1)))
+        
+        if not versions:
+            print("No LoRA weights found to merge.")
+            return
+            
+        latest_version = max(versions)
+        latest_adapter_dir = f"{base_weights_dir}/v{latest_version}"
+        print(f"🔄 Picking up the latest LoRA updates from {latest_adapter_dir}...")
+        
+        # Load base model again (from config)
+        print(f"📥 Loading base model ({self.config.model_path}) for merging...")
+        if 't5' in self.config.model.lower():
+            base_model = AutoModelForSeq2SeqLM.from_pretrained(self.config.model_path, local_files_only=True)
+        else:
+            base_model = AutoModelForCausalLM.from_pretrained(self.config.model_path, local_files_only=True)
+            
+        # Apply PEFT
+        peft_model = PeftModel.from_pretrained(base_model, latest_adapter_dir)
+        
+        print(f"🔄 Merging latest LoRA weights with base model...")
+        merged_model = peft_model.merge_and_unload()
+        
+        print(f"💾 Saving merged model to main directory: {self.output_dir}...")
+        merged_model.save_pretrained(self.output_dir)
+        self.tokenizer.save_pretrained(self.output_dir)
+        print(f"✅ Merged model ready for GGUF conversion at: {self.output_dir}")
+
     def _save_metrics(self, token_stats: Dict):
         """Save training metrics to JSON"""
         import json
-        version_match = re.search(r'v(\d+)', self.output_dir)
-        version = int(version_match.group(1)) if version_match else 1
         
-        merged_path = f"{self.output_dir}_merged" if self.config.is_lora else None
-        adapter_path = self.output_dir if self.config.is_lora else None
-
         metrics = TrainingMetrics(
             model_type=self.config.model,
             training_method=self.config.training_method,
@@ -131,10 +191,10 @@ class BaseTrainer(ABC):
             avg_tokens=token_stats['avg_tokens'],
             batch_size=self.config.batch_size,
             learning_rate=self.config.learning_rate,
-            version=version,
+            version=self.version,
             base_model_path=self.config.model_path,
-            lora_adapter_path=adapter_path,
-            merged_model_path=merged_path,
+            lora_adapter_path=self.adapter_dir if self.config.is_lora else None,
+            merged_model_path=self.output_dir if self.config.is_lora else None,
             lora_r=self.config.lora_r,
             lora_alpha=self.config.lora_alpha,
             lora_dropout=self.config.lora_dropout
@@ -142,6 +202,10 @@ class BaseTrainer(ABC):
         
         with open(f"{self.output_dir}/training_metrics.json", 'w') as f:
             json.dump(asdict(metrics), f, indent=2)
+            
+        if self.config.is_lora and self.adapter_dir:
+            with open(f"{self.adapter_dir}/training_metrics.json", 'w') as f:
+                json.dump(asdict(metrics), f, indent=2)
     
     def train(self, texts: List[str]):
         """Main training pipeline taking a pre-loaded dataset list of strings"""
@@ -181,17 +245,11 @@ class BaseTrainer(ABC):
         
         # Save
         if self.config.is_lora:
-            print(f"\n💾 Saving LoRA adapters to {self.output_dir}...")
-            self.model.save_pretrained(self.output_dir)
-            self.tokenizer.save_pretrained(self.output_dir)
+            print(f"\n💾 Saving LoRA adapters to {self.adapter_dir}...")
+            self.model.save_pretrained(self.adapter_dir)
+            self.tokenizer.save_pretrained(self.adapter_dir)
             
-            print(f"🔄 Merging LoRA weights with base model...")
-            merged_model = self.model.merge_and_unload()
-            merged_dir = f"{self.output_dir}_merged"
-            print(f"💾 Saving merged model to {merged_dir}...")
-            merged_model.save_pretrained(merged_dir)
-            self.tokenizer.save_pretrained(merged_dir)
-            print(f"✅ Merged model ready for GGUF conversion at: {merged_dir}")
+            self._merge_latest_lora()
         else:
             trainer.save_model(self.output_dir)
             self.tokenizer.save_pretrained(self.output_dir)
